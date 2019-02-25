@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html>
+  <head>
+	<meta charset="utf-8">
+	<title>WebGPU</title>
+  </head>
+  <body>
+	<h1 style="font-family:verdana;">WebGPU</h1>
+	<div style="font-family:verdana;">GPU-Accelerated Marching Cubes with WebGPU.</div>
+	<canvas id="canvas" style="visibility:visible" width="800" height="600" style="border: solid 1px #aaaaaa;"></canvas>
+	<div id="nogpu" style="font-family:verdana;visibility:hidden">
+		<p>Whoa there!</p>
+		<p>I couldn't get a WebGPU context so you're either using a browser that doesn't support it or you don't have it enabled.</p>
+		<p>In Safari it's under Developer->Experimental Features</p>
+	</div>
+
+	<script src="gl-matrix.min.js"></script>
+	<script src="trackball.js"></script>
+	<script src="lookup-tables.js"></script>
+	<script id="displayShader" type="x-shader/x-metal">
+		using namespace metal;
+
+		struct Vertex {
+			float4 position;
+			float3 normal;
+		};
+		struct Uniforms {
+			float4x4 mvp_matrix;
+			float3x3 normal_matrix;
+		};
+		struct IsoUniforms {
+			float isosurface;
+			float isomin;
+			float isomax;
+		};
+		struct VertexOut {
+			float4 position [[position]];
+			float3 normal;
+		};
+
+		vertex VertexOut vertex_main(device Vertex *vertices [[buffer(0)]],
+			constant Uniforms &uniforms [[buffer(1)]],
+			uint vid [[vertex_id]])
+		{
+			VertexOut out;
+			out.position = uniforms.mvp_matrix * float4(vertices[vid].position.xyz, 1);
+			out.normal = uniforms.normal_matrix * vertices[vid].normal;
+			return out;
+		}
+
+		fragment float4 fragment_main(VertexOut vert [[stage_in]],
+			constant IsoUniforms &iso_uniforms [[buffer(0)]],
+			bool front_facing [[front_facing]])
+		{
+			float3 diffuse = dot(vert.normal, normalize(float3(-1,0,0)));
+			diffuse += float3(0.2);
+			float3 color = float3(0.5,0,(iso_uniforms.isosurface-iso_uniforms.isomin)/(iso_uniforms.isomax-iso_uniforms.isomin));
+			return float4(diffuse * color, 1);
+		}
+	</script>
+	<script id="marchingCubesComputeShader" type="x-shader/x-metal">
+		using namespace metal;
+
+		struct Voxel {
+			float value;
+		};
+
+		struct Vertices {
+			float4 position;
+			float3 normal;
+		};
+
+		struct FloatUniforms {
+			float iso;
+		};
+
+		struct UintUniforms {
+			uint output_buffer_count;
+			uint cube_dimensions_x;
+			uint cube_dimensions_y;
+			uint cube_dimensions_z;
+		};
+
+		static constant float3 decals[8]={
+			float3(0.0f, 0.0f, 0.0f),
+			float3(1.0f, 0.0f, 0.0f),
+			float3(1.0f, 1.0f, 0.0f),
+			float3(0.0f, 1.0f, 0.0f),
+			float3(0.0f, 0.0f, 1.0f),
+			float3(1.0f, 0.0f, 1.0f),
+			float3(1.0f, 1.0f, 1.0f),
+			float3(0.0f, 1.0f, 1.0f)
+		};
+
+		float3 voxel_pos(int i, float3 voxel_loc)
+		{
+		  return voxel_loc + decals[i];
+		}
+
+		float voxel_val(int i, device Voxel *voxels, uint3 cube_dimensions, float3 voxel_loc)
+		{
+		  float3 vp = voxel_pos(i, voxel_loc);
+		  
+		  uint3 uvp = uint3( uint(vp.x), uint(vp.y), uint(vp.z) );
+		  uint voxel_index = clamp( uvp.z + cube_dimensions.y * (uvp.y + cube_dimensions.x * uvp.x), 0u, cube_dimensions.x*cube_dimensions.y*cube_dimensions.z);
+		  
+		  return voxels[voxel_index].value;
+		}
+
+		int tri_value(int x, int y, constant int *tri_lookup)
+		{
+		  return tri_lookup[x*16+y];
+		}
+
+		kernel void marching_cubes(device Voxel *voxels [[buffer(0)]],
+			device Vertices *vertices [[buffer(1)]],
+			constant FloatUniforms &float_uniforms [[buffer(2)]],
+			constant UintUniforms &uint_uniforms [[buffer(3)]],
+			device atomic_uint &counter [[buffer(4)]],
+			constant int *tri_lookup [[buffer(5)]],
+			uint3 gid [[thread_position_in_grid]])
+		{
+			if( gid.x == 0 || gid.x >= uint_uniforms.cube_dimensions_x-1 
+			  || gid.y == 0 || gid.y >= uint_uniforms.cube_dimensions_y-1 
+			  || gid.z == 0 || gid.z >= uint_uniforms.cube_dimensions_z-1 )
+			{ return; }
+
+			float3 voxel_loc = float3(gid.x, gid.y, gid.z);
+			float isovalue = float_uniforms.iso;
+			uint3 cube_dimensions = uint3( uint(uint_uniforms.cube_dimensions_x), uint(uint_uniforms.cube_dimensions_y), uint(uint_uniforms.cube_dimensions_z) );
+			int cube_idx=0;
+			float voxel_val0 = voxel_val(0, voxels, cube_dimensions, voxel_loc);
+			float voxel_val1 = voxel_val(1, voxels, cube_dimensions, voxel_loc);
+			float voxel_val2 = voxel_val(2, voxels, cube_dimensions, voxel_loc);
+			float voxel_val3 = voxel_val(3, voxels, cube_dimensions, voxel_loc);
+			float voxel_val4 = voxel_val(4, voxels, cube_dimensions, voxel_loc);
+			float voxel_val5 = voxel_val(5, voxels, cube_dimensions, voxel_loc);
+			float voxel_val6 = voxel_val(6, voxels, cube_dimensions, voxel_loc);
+			float voxel_val7 = voxel_val(7, voxels, cube_dimensions, voxel_loc);
+			cube_idx = int(voxel_val0 < isovalue);
+			cube_idx += int(voxel_val1 < isovalue)*2;
+			cube_idx += int(voxel_val2 < isovalue)*4;
+			cube_idx += int(voxel_val3 < isovalue)*8;
+			cube_idx += int(voxel_val4 < isovalue)*16;
+			cube_idx += int(voxel_val5 < isovalue)*32;
+			cube_idx += int(voxel_val6 < isovalue)*64;
+			cube_idx += int(voxel_val7 < isovalue)*128;
+			if( cube_idx == 0 )
+			  return;
+			
+			float3 verts[12] = {
+				mix(voxel_pos(0, voxel_loc), voxel_pos(1, voxel_loc), (isovalue-voxel_val0)/(voxel_val1-voxel_val0)),
+				mix(voxel_pos(1, voxel_loc), voxel_pos(2, voxel_loc), (isovalue-voxel_val1)/(voxel_val2-voxel_val1)),
+				mix(voxel_pos(2, voxel_loc), voxel_pos(3, voxel_loc), (isovalue-voxel_val2)/(voxel_val3-voxel_val2)),
+				mix(voxel_pos(3, voxel_loc), voxel_pos(0, voxel_loc), (isovalue-voxel_val3)/(voxel_val0-voxel_val3)),
+				mix(voxel_pos(4, voxel_loc), voxel_pos(5, voxel_loc), (isovalue-voxel_val4)/(voxel_val5-voxel_val4)),
+				mix(voxel_pos(5, voxel_loc), voxel_pos(6, voxel_loc), (isovalue-voxel_val5)/(voxel_val6-voxel_val5)),
+				mix(voxel_pos(6, voxel_loc), voxel_pos(7, voxel_loc), (isovalue-voxel_val6)/(voxel_val7-voxel_val6)),
+				mix(voxel_pos(7, voxel_loc), voxel_pos(4, voxel_loc), (isovalue-voxel_val7)/(voxel_val4-voxel_val7)),
+				mix(voxel_pos(0, voxel_loc), voxel_pos(4, voxel_loc), (isovalue-voxel_val0)/(voxel_val4-voxel_val0)),
+				mix(voxel_pos(1, voxel_loc), voxel_pos(5, voxel_loc), (isovalue-voxel_val1)/(voxel_val5-voxel_val1)),
+				mix(voxel_pos(2, voxel_loc), voxel_pos(6, voxel_loc), (isovalue-voxel_val2)/(voxel_val6-voxel_val2)),
+				mix(voxel_pos(3, voxel_loc), voxel_pos(7, voxel_loc), (isovalue-voxel_val3)/(voxel_val7-voxel_val3))
+			};
+			uint next_vertex = 0;
+			for( int i=0; i<16; i+=3 ){
+			  if( tri_value(cube_idx, i, tri_lookup) != -1 ){
+				next_vertex = atomic_fetch_add_explicit(&counter, 3, memory_order_relaxed);
+				if( next_vertex < uint_uniforms.output_buffer_count-3 ) {
+			      vertices[next_vertex+0].position = float4(verts[tri_value(cube_idx, i+0, tri_lookup)].xyz, isovalue);
+			      vertices[next_vertex+1].position = float4(verts[tri_value(cube_idx, i+1, tri_lookup)].xyz, isovalue);
+				  vertices[next_vertex+2].position = float4(verts[tri_value(cube_idx, i+2, tri_lookup)].xyz, isovalue);
+				  float3 n = normalize(cross(vertices[next_vertex+1].position.xyz-vertices[next_vertex].position.xyz, vertices[next_vertex+2].position.xyz-vertices[next_vertex].position.xyz));
+				  vertices[next_vertex+0].normal = n;
+				  vertices[next_vertex+1].normal = n;
+				  vertices[next_vertex+2].normal = n;
+			    }
+			  }else{ break; }
+			}
+		}
+	</script>
+	<script id="canvas">
+		let canvas, webgpu;
+		let shaderCode;
+		let shaderLibrary;
+
+		let commandQueue = null;
+
+		// the output buffer that the compute shader will write to
+		// this will be used as the input vertex buffer for the
+		// render pipeline
+		let vertexBuffer;
+		let vertexStride = 7; // (x,y,z,w,nx,ny,nz)
+		let vertexData = new Float32Array(30000*3*vertexStride); // 3 tris
+		
+		////////
+		// rendering bits
+		////////
+		let vertexFunction, fragmentFunction;
+		let pipelineDescriptor, pipelineState;
+		let depthStencilDescriptor, depthStencilState;
+		let depthTextureDescriptor, depthTexture;
+		let renderPassDescriptor;
+
+		let renderUniformsBuffer = null;
+		let renderUniforms = new Float32Array(3);
+
+		let projectionMatrix = mat4.create();
+		let matrixBuffer = null;
+		let rotator;
+
+		////////
+		// compute bits
+		////////
+		let computeShaderCode;
+		let computeShaderLibrary;
+		let computeFunction;
+		let computePipelineState;
+
+		// used to keep track of the number of triangles the shader
+		// has attempted to write into the output buffer
+		// if, after the compute pipeline is executed, this is larger
+		// than the number of triangles the vertexBuffer can accommodate
+		// we need to resize the vertex buffer and execute the compute
+		// again.
+		let atomicCounterBuffer;
+
+		// 2 buffers here, i tried using a DataView to manage an ArrayBuffer
+		// of multiple types but it was going wrong when it got to the shader
+		// for some reason
+		let computeUintUniformsBuffer = null;
+		let computeFloatUniformsBuffer = null;
+
+		// data that backs the above buffers
+		let atomicCounter = new Uint32Array(1);
+		let computeFloatUniforms = new Float32Array(1);
+		let computeUintUniforms = new Uint32Array(4);
+		
+		// size of the voxel volume
+		let volumeDimensions = {'x': 32, 'y': 32, 'z': 32};
+
+		// voxels array and buffer
+		let voxels;
+		let voxelBuffer = null;
+
+		// buffer for the triangle lookup table
+		let triLookupTableBuffer = null;
+
+		// variables to control surface extraction
+		let isomin;
+		let isomax;
+		let isoincr;
+		let isovalue;
+
+		initData = function() {
+			initVoxelMesh(volumeDimensions.x, volumeDimensions.y, volumeDimensions.z);
+			
+			isomax = (volumeDimensions.x > volumeDimensions.y) ? (volumeDimensions.x > volumeDimensions.z ? volumeDimensions.x : volumeDimensions.z) : (volumeDimensions.y > volumeDimensions.z) ? volumeDimensions.y : volumeDimensions.z;
+			isomin = isomax*0.1;
+			isoincr = (isomin+(isomax-isomin)) * 0.01;
+			isomax *= 0.9;
+		}
+
+		initVoxelMesh = function(x, y, z) {
+			voxels = new Float32Array(x*y*z);
+			let center = {'x':x/2,'y':y/2,'z':z/2 };
+			let diff = {};
+			
+			let voxelCount=0;
+			for (let i = 0; i < x; i++)
+			for (let j = 0; j < y; j++)
+			for (let k = 0; k < z; k++)
+			{
+				let pt = {'x':i, 'y':j, 'z':k};
+				diff.x = pt.x - center.x;
+				diff.y = pt.y - center.y;
+				diff.z = pt.z - center.z;
+				let dist = Math.sqrt(diff.x*diff.x + diff.y*diff.y + diff.z*diff.z);
+				voxels[voxelCount++]=dist;
+			}
+		}
+
+		resizeVertexBuffer = function() {
+			vertexData = new Float32Array(vertexData.length + vertexData.length);
+			vertexBuffer = null;
+		}
+
+		window.onload = function () {
+			canvas = document.getElementById("canvas");
+			
+			// try to get a webgpu context
+			webgpu = canvas.getContext("webgpu");
+
+			if( !webgpu )
+			{
+				document.getElementById("nogpu").style.visibility = "visible";
+				canvas.height = 1;
+				canvas.width = 1;
+				canvas.style.visibility = "hidden";
+				return;
+			}
+
+			initData();
+
+			setupCompute(webgpu);
+			setupRender(webgpu);
+
+			rotator = new TrackballRotator(canvas, function(){}, 0.1);
+
+			mat4.perspective(projectionMatrix, (2 * Math.PI) / 5, Math.abs(canvas.width / canvas.height), 0.01, 1000.0);
+
+			window.requestAnimationFrame(compute);
+		}
+
+		setupRender = function() {
+			shaderCode = document.getElementById("displayShader").text;
+
+			shaderLibrary = webgpu.createLibrary(shaderCode);
+			vertexFunction = shaderLibrary.functionWithName("vertex_main");
+			fragmentFunction = shaderLibrary.functionWithName("fragment_main");
+			
+			// setup the render pipeline with the shader functions and a color and depth attachment
+			pipelineDescriptor = new WebGPURenderPipelineDescriptor();
+			pipelineDescriptor.vertexFunction = vertexFunction;
+			pipelineDescriptor.fragmentFunction = fragmentFunction;
+			pipelineDescriptor.colorAttachments[0].pixelFormat = webgpu.PixelFormatBGRA8Unorm;
+    		pipelineDescriptor.depthAttachmentPixelFormat = webgpu.PixelFormatDepth32Float;
+			pipelineState = webgpu.createRenderPipelineState(pipelineDescriptor);
+
+			depthStencilDescriptor = new WebGPUDepthStencilDescriptor();
+			depthStencilDescriptor.depthWriteEnabled = true;
+			depthStencilDescriptor.depthCompareFunction = "less";
+
+			depthStencilState = webgpu.createDepthStencilState(depthStencilDescriptor);
+
+			depthTextureDescriptor = new WebGPUTextureDescriptor(webgpu.PixelFormatDepth32Float, canvas.width, canvas.height, false);
+			depthTextureDescriptor.textureType = webgpu.TextureType2D;
+			depthTextureDescriptor.sampleCount = 1;
+			depthTextureDescriptor.usage = webgpu.TextureUsageUnknown;
+			depthTextureDescriptor.storageMode = webgpu.StorageModePrivate;
+
+			depthTexture = webgpu.createTexture(depthTextureDescriptor);
+
+			renderPassDescriptor = new WebGPURenderPassDescriptor();
+			renderPassDescriptor.colorAttachments[0].loadAction = webgpu.LoadActionClear;
+			renderPassDescriptor.colorAttachments[0].storeAction = webgpu.StoreActionStore;
+			renderPassDescriptor.colorAttachments[0].clearColor = [0.604, 0.808, 0.925, 1.0];
+
+			renderPassDescriptor.depthAttachment.loadAction = webgpu.LoadActionClear;
+			renderPassDescriptor.depthAttachment.storeAction = webgpu.StoreActionDontCare;
+			renderPassDescriptor.depthAttachment.clearDepth = 1.0;
+			renderPassDescriptor.depthAttachment.texture = depthTexture;
+		}
+
+		setupCompute = function() {
+			computeShaderCode = document.getElementById("marchingCubesComputeShader").text;
+			computeShaderLibrary = webgpu.createLibrary(computeShaderCode);
+			computeFunction = computeShaderLibrary.functionWithName("marching_cubes");
+			computePipelineState = webgpu.createComputePipelineState(computeFunction);
+		}
+
+		updateRenderUniforms = function() {
+			if(!renderUniformsBuffer)
+				renderUniformsBuffer = webgpu.createBuffer(renderUniforms);
+
+			let refRenderUniformsBuffer = new Float32Array(renderUniformsBuffer.contents);
+			refRenderUniformsBuffer[0]=isovalue;
+			refRenderUniformsBuffer[1]=isomin;
+			refRenderUniformsBuffer[2]=isomax;
+		}
+
+		updateComputeUniforms = function() {
+			// initialize any necessary buffers
+			if(!atomicCounterBuffer)
+				atomicCounterBuffer = webgpu.createBuffer(atomicCounter);
+
+			if(!voxelBuffer)
+				voxelBuffer = webgpu.createBuffer(voxels);
+
+			if(!vertexBuffer)
+				vertexBuffer = webgpu.createBuffer(vertexData);
+
+			if(!triLookupTableBuffer)
+				triLookupTableBuffer = webgpu.createBuffer(triTable);
+
+			if(!computeFloatUniformsBuffer)
+				computeFloatUniformsBuffer = webgpu.createBuffer(computeFloatUniforms);
+
+			if(!computeUintUniformsBuffer)
+				computeUintUniformsBuffer = webgpu.createBuffer(computeUintUniforms);
+
+			// update uniform buffers
+			if( isovalue < isomax )
+				isovalue+=isoincr;
+			else
+				isovalue=isomin;
+
+			let refComputeFloatUniformsBuffer = new Float32Array(computeFloatUniformsBuffer.contents);
+			let refComputeUintUniformsBuffer = new Uint32Array(computeUintUniformsBuffer.contents);
+
+			refComputeFloatUniformsBuffer[0]=isovalue;
+			refComputeUintUniformsBuffer[0]=vertexData.length/vertexStride;
+			refComputeUintUniformsBuffer[1]=volumeDimensions.x;
+			refComputeUintUniformsBuffer[2]=volumeDimensions.y;
+			refComputeUintUniformsBuffer[3]=volumeDimensions.z;
+
+			let refAtomicCounterBuffer = new Uint32Array(atomicCounterBuffer.contents);
+			refAtomicCounterBuffer[0] = 0;
+		}
+
+		updateMatrices = function() {
+			let mvp_matrix = mat4.create();
+			let mvMatrix = rotator.getViewMatrix();
+
+			// center the grid
+			let offset = vec3.create();
+			vec3.set(offset, -volumeDimensions.x*0.5, -volumeDimensions.y*0.5, -volumeDimensions.z*0.5);
+			mat4.translate(mvMatrix, mvMatrix, offset);
+
+			// move it into view
+			let translate = vec3.create();
+			vec3.set(translate, 0, 0, -volumeDimensions.z*2);
+			let translationMatrix = mat4.create();
+			mat4.translate(translationMatrix, translationMatrix, translate);
+
+			mat4.multiply(mvMatrix, translationMatrix, mvMatrix);
+
+			mat4.multiply(mvp_matrix, projectionMatrix, mvMatrix);
+
+			let normal_matrix = mat3.create();
+			mat3.normalFromMat4(normal_matrix, mvMatrix);
+
+			// make space for both matrices
+			if( !matrixBuffer )
+			{
+				let tmpArr = new Float32Array(16+9); // 4x4 + 3x3 matrices
+				matrixBuffer = webgpu.createBuffer(tmpArr);
+			}
+
+			// update matrix data
+			let refMatrixBuffer = new Float32Array(matrixBuffer.contents);
+			let k=0;
+			for (let i = 0; i < 16; ++i) {
+        		refMatrixBuffer[k++] = mvp_matrix[i];
+			}
+			for (let i = 0; i < 9; ++i ) {
+        		refMatrixBuffer[k++] = normal_matrix[i];
+			}
+		}
+
+		render = function() {
+			updateMatrices();
+			updateRenderUniforms();
+
+			// how many triangles did we try and draw?
+			let refAtomicCounterBuffer = new Uint32Array(atomicCounterBuffer.contents);
+
+			// was there enough space?
+			if( vertexData.length / 4 > refAtomicCounterBuffer[0] && refAtomicCounterBuffer[0] > 0 )
+			{
+				let drawable = webgpu.nextDrawable();
+				renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
+
+				// can assume the command queue was created in the compute stage
+				let commandBuffer = commandQueue.createCommandBuffer();
+
+				let commandEncoder = commandBuffer.createRenderCommandEncoderWithDescriptor(renderPassDescriptor);
+
+				commandEncoder.setRenderPipelineState(pipelineState);
+				commandEncoder.setDepthStencilState(depthStencilState);
+
+				commandEncoder.setVertexBuffer(vertexBuffer, 0, 0);
+				commandEncoder.setVertexBuffer(matrixBuffer, 0, 1);
+				commandEncoder.setFragmentBuffer(renderUniformsBuffer, 0, 0);
+
+				commandEncoder.drawPrimitives(webgpu.PrimitiveTypeTriangle, 0, refAtomicCounterBuffer[0]);
+
+				commandEncoder.endEncoding();
+
+				commandBuffer.presentDrawable(drawable);
+				commandBuffer.commit();
+			}
+			// if there wasn't enough space then resize the buffer and try again
+			else if( refAtomicCounterBuffer[0] != 0 )
+			{
+				console.log('Resizing Buffer. Needed ' + refAtomicCounterBuffer[0] + ' but only had ' + vertexData.length/vertexStride);
+				resizeVertexBuffer();
+			}
+
+			window.requestAnimationFrame(compute);
+		}
+
+		compute = function() {
+			updateComputeUniforms();
+
+			// need to create a command queue, we will use this for compute and render
+			if( !commandQueue )
+				commandQueue = webgpu.createCommandQueue();
+
+			let commandBuffer = commandQueue.createCommandBuffer();
+
+			// callback for when this command buffer completes
+			commandBuffer.completed.then(function(){
+				render();
+			});
+
+			let commandEncoder = commandBuffer.createComputeCommandEncoder();
+
+			commandEncoder.setComputePipelineState(computePipelineState);
+
+			// bind all the data to the shader
+			commandEncoder.setBuffer(voxelBuffer, 0, 0);
+			commandEncoder.setBuffer(vertexBuffer, 0, 1);
+			commandEncoder.setBuffer(computeFloatUniformsBuffer, 0, 2);
+			commandEncoder.setBuffer(computeUintUniformsBuffer, 0, 3);
+			commandEncoder.setBuffer(atomicCounterBuffer, 0, 4);
+			commandEncoder.setBuffer(triLookupTableBuffer, 0, 5);
+
+			let threadgroupsPerGrid = { width: volumeDimensions.x, height: volumeDimensions.y, depth: volumeDimensions.z };
+
+			// ...should these values in computePipelineState be 'undefined' at this point???
+			//let w = computePipelineState.threadExecutionWidth;
+			//let h = computePipelineState.maxTotalThreadsPerThreadgroup / w;
+			let threadsPerThreadgroup = { width: /*w*/1, height: 1/*h*/, depth: 1 };
+
+			commandEncoder.dispatch(threadgroupsPerGrid, threadsPerThreadgroup);
+
+			commandEncoder.endEncoding();
+
+			commandBuffer.commit();
+		}
+	</script>
+  </body>
+</html>
